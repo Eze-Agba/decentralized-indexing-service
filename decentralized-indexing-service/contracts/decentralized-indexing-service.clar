@@ -354,3 +354,125 @@
     topic-hash: (string-ascii 64)
   }
 )
+
+(define-map SubnetMembership
+  {
+    subnet-id: (string-ascii 32),
+    node: principal
+  }
+  {
+    join-block: uint,
+    stake-committed: uint
+  }
+)
+
+;; Global state variables for new features
+(define-data-var current-proposal-id uint u0)
+(define-data-var current-reward-period uint u0)
+(define-data-var total-delegated-stake uint u0)
+(define-data-var total-rewards-distributed uint u0)
+
+;; Update node delegation settings
+(define-public (update-delegation-settings
+  (commission-rate uint)
+  (accepting-delegations bool)
+)
+  (let (
+    (node tx-sender)
+    (node-info (unwrap! (map-get? IndexingNodes { node-address: node }) ERR_INVALID_NODE))
+    (delegation-info (default-to 
+                      {
+                        total-delegated: u0,
+                        delegator-count: u0,
+                        commission-rate: u50,
+                        accepting-delegations: true
+                      }
+                      (map-get? NodeDelegationInfo { node-address: node })))
+  )
+    ;; Verify commission rate (max 30%)
+    (asserts! (<= commission-rate u300) ERR_UNAUTHORIZED)
+    
+    ;; Update node delegation info
+    (map-set NodeDelegationInfo
+      { node-address: node }
+      {
+        total-delegated: (get total-delegated delegation-info),
+        delegator-count: (get delegator-count delegation-info),
+        commission-rate: commission-rate,
+        accepting-delegations: accepting-delegations
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+;; Start a new reward period
+(define-public (start-reward-period
+  (total-rewards uint)
+)
+  (let (
+    (current-period (var-get current-reward-period))
+    (admin tx-sender)
+  )
+    ;; Only admin can call this (simplified for demonstration)
+    ;; Transfer rewards to contract
+    (try! (stx-transfer? total-rewards admin (as-contract tx-sender)))
+    
+    ;; Create new reward period
+    (map-set RewardPeriods
+      { period-id: (+ current-period u1) }
+      {
+        start-block: stacks-block-height,
+        end-block: (+ stacks-block-height REWARD_CLAIM_PERIOD),
+        total-rewards: total-rewards,
+        distributed: false
+      }
+    )
+    
+    ;; Update current period
+    (var-set current-reward-period (+ current-period u1))
+    
+    (ok (+ current-period u1))
+  )
+)
+
+;; Claim rewards for a period
+(define-public (claim-rewards
+  (period-id uint)
+)
+  (let (
+    (node tx-sender)
+    (node-info (unwrap! (map-get? IndexingNodes { node-address: node }) ERR_INVALID_NODE))
+    (reward-info (unwrap! (map-get? NodeRewards 
+                           { 
+                             node: node,
+                             period-id: period-id
+                           }) 
+                         ERR_INVALID_REWARD_PERIOD))
+    (period-info (unwrap! (map-get? RewardPeriods { period-id: period-id }) ERR_INVALID_REWARD_PERIOD))
+  )
+    ;; Verify reward not already claimed
+    (asserts! (not (get claimed reward-info)) ERR_REWARD_CLAIM_FAILED)
+    
+    ;; Verify reward period has ended
+    (asserts! (>= stacks-block-height (get end-block period-info)) ERR_INVALID_REWARD_PERIOD)
+    
+    ;; Transfer reward
+    (try! (as-contract (stx-transfer? (get amount reward-info) tx-sender node)))
+    
+    ;; Mark as claimed
+    (map-set NodeRewards
+      { 
+        node: node,
+        period-id: period-id
+      }
+      (merge reward-info { claimed: true })
+    )
+    
+    ;; Update total rewards distributed
+    (var-set total-rewards-distributed (+ (var-get total-rewards-distributed) (get amount reward-info)))
+    
+    (ok (get amount reward-info))
+  )
+)
